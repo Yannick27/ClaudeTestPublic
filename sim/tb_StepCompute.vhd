@@ -74,6 +74,26 @@ begin
       n_tests := n_tests + 1;
     end procedure;
   begin
+    -- back-to-back pulses (one angle per clock): expect 3 consecutive results
+    wait until rising_edge(Clk);
+    Meas <= to_unsigned(0, 16); Targ <= to_unsigned(1000, 16); Valid <= '1';  -- 17 steps
+    wait until rising_edge(Clk);
+    Targ <= to_unsigned(20, 16);                                              -- 1 step, vmax 22598
+    wait until rising_edge(Clk);
+    Targ <= to_unsigned(1, 16);                                               -- reached
+    wait until rising_edge(Clk);
+    Valid <= '0';
+    wait until OutValid = '1';
+    wait for 1 ns;
+    assert Steps = 17 and VMax = x"FFFF" and Dir = '1' report "burst 1 wrong" severity failure;
+    wait until rising_edge(Clk); wait for 1 ns;
+    assert OutValid = '1' and Steps = 1 and to_integer(unsigned(VMax)) = 22598 report "burst 2 wrong" severity failure;
+    wait until rising_edge(Clk); wait for 1 ns;
+    assert OutValid = '1' and Steps = 0 and VMax = x"0000" report "burst 3 wrong" severity failure;
+    wait until rising_edge(Clk); wait for 1 ns;
+    assert OutValid = '0' report "burst: extra valid" severity failure;
+    prev_dir := '1';
+
     run(65535, 1);   -- wrap-around example: 2 LSB away, counter-clockwise
     run(1, 65535);   -- same, clockwise
     run(0, 0);

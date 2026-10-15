@@ -5,13 +5,18 @@
 -- the rotation direction, the number of full rotation steps and the amplitude
 -- (VMax) of a last partial step.
 --
--- Target : Microchip RTG4 FPGA (no DSP / multiplier needed, no hard divider
---          needed: the two divisions are done by a small shift/subtract
---          divider shared by both cases).
+-- Target : Microchip RTG4 FPGA. RTG4 has no hard divider, but the divisor is a
+--          constant, so:
+--            * AngleDiff / ROT_PER_STEP  = (AngleDiff * M) >> SHIFT
+--              (one 16x17 unsigned multiply -> one MACC block, with input and
+--              output registers)
+--            * (2^16-1) * AngleDiff / ROT_PER_STEP for AngleDiff <= ROT_PER_STEP
+--              is a small constant table (ROT_PER_STEP+1 entries).
+--          Both are exact; this is checked at elaboration (asserts below).
 --
--- Latency: ValidAnglexSI -> OutputValidxSO is at most 36 clock cycles
---          (about 360 ns at 100 MHz). A ValidAnglexSI pulse that arrives while
---          a computation is running is ignored.
+-- Latency: OutputValidxSO is high 3 clock cycles after ValidAnglexSI.
+--          The design is a pure pipeline: a new angle can be accepted on
+--          every clock cycle.
 --
 -- Conventions:
 --   * Increasing angle = counter-clockwise (RotDirectionxSO = '1')
@@ -44,128 +49,112 @@ architecture rtl of StepCompute is
   constant ROT_ACCURACY     : integer := integer(ROT_ACCURACY_DEG / 360.0 * 2.0 ** 16);  -- = 2
   constant ROT_PER_STEP     : integer := integer(ROT_PER_STEP_DEG / 360.0 * 2.0 ** 16);  -- = 58
 
-  constant MAX_STEPS : natural := 2000;  -- range of StepNumberxDO
+  constant MAX_DIFF : integer := 2 ** 15;  -- largest shortest-way angle difference
 
-  constant DIV_W : natural := 32;        -- dividend / quotient width
-  constant DEN   : unsigned(16 downto 0) := to_unsigned(ROT_PER_STEP, 17);
+  -- reciprocal multiplication: floor(x / ROT_PER_STEP) = (x * RECIP_M) >> RECIP_S
+  constant RECIP_S : integer := 22;
+  constant RECIP_M : integer := (2 ** RECIP_S + ROT_PER_STEP - 1) / ROT_PER_STEP;  -- ceil(2^S / P), 17 bit
+  constant RECIP_E : integer := RECIP_M * ROT_PER_STEP - 2 ** RECIP_S;             -- rounding error of M
 
-  type state_t is (IDLE, CLASSIFY, DIVIDE, OUTPUT);
-  signal State : state_t := IDLE;
+  -- partial step: VMax = (2^16 - 1) * i / ROT_PER_STEP, i = 0 .. ROT_PER_STEP
+  type vmax_rom_t is array (0 to ROT_PER_STEP) of std_logic_vector(15 downto 0);
+  function init_vmax_rom return vmax_rom_t is
+    variable rom : vmax_rom_t;
+  begin
+    for i in 0 to ROT_PER_STEP loop
+      rom(i) := std_logic_vector(to_unsigned((i * 65535) / ROT_PER_STEP, 16));
+    end loop;
+    return rom;
+  end function;
+  constant VMAX_ROM : vmax_rom_t := init_vmax_rom;
 
-  attribute syn_encoding : string;
-  attribute syn_encoding of State : signal is "safe";  -- Synplify: SEU-safe FSM
+  -- pipeline stage 1: shortest angle difference
+  signal V1xS    : std_logic             := '0';
+  signal Diff1xD : unsigned(15 downto 0) := (others => '0');
+  signal Dir1xS  : std_logic             := '0';
 
-  signal AngleDiffxD : unsigned(15 downto 0) := (others => '0');  -- |target - measured| on the circle
-  signal DirxS       : std_logic             := '0';
-  signal FarxS       : std_logic             := '0';  -- '1': far from target (full steps)
-  signal ReachedxS   : std_logic             := '0';  -- '1': target reached
-
-  -- shift / subtract divider
-  signal NumQuotxD : unsigned(DIV_W - 1 downto 0) := (others => '0');  -- dividend shifted out, quotient shifted in
-  signal RemxD     : unsigned(16 downto 0)        := (others => '0');
-  signal CntxD     : natural range 0 to DIV_W - 1 := 0;
+  -- pipeline stage 2: multiplication (MACC) / table / classification
+  signal V2xS     : std_logic             := '0';
+  signal Prod2xD  : unsigned(32 downto 0) := (others => '0');
+  signal Vmax2xD  : std_logic_vector(15 downto 0) := (others => '0');
+  signal Dir2xS   : std_logic             := '0';
+  signal Far2xS   : std_logic             := '0';  -- far from target: full steps
+  signal Close2xS : std_logic             := '0';  -- close to target: one partial step
 
 begin
 
-  assert ROT_PER_STEP > 0 and ROT_PER_STEP < 2 ** 15
+  -- elaboration checks: the reciprocal is exact for all x <= MAX_DIFF
+  --   (x*M = x*2^S/P + x*E/P, exact if x*E < 2^S)
+  assert ROT_PER_STEP > 0 and ROT_PER_STEP < 1024
     report "ROT_PER_STEP out of supported range" severity failure;
+  assert RECIP_M < 2 ** 17
+    report "reciprocal does not fit a single 18x18 MACC, lower RECIP_S" severity failure;
+  assert MAX_DIFF * RECIP_E < 2 ** RECIP_S
+    report "reciprocal division not exact, raise RECIP_S" severity failure;
+  assert MAX_DIFF / ROT_PER_STEP <= 2000
+    report "StepNumberxDO range too small" severity failure;
 
   process (ClkxCI)
-    variable DeltaxD   : unsigned(15 downto 0);
-    variable ShiftedxD : unsigned(16 downto 0);
-    variable StepsxD   : natural;
+    variable DeltaxD : unsigned(15 downto 0);
+    variable IdxxD   : natural range 0 to ROT_PER_STEP;
   begin
     if rising_edge(ClkxCI) then
-      OutputValidxSO <= '0';
 
-      case State is
+      ------------------------------------------------------------------------
+      -- stage 1: shortest signed distance on the circle (wraps modulo 2^16)
+      ------------------------------------------------------------------------
+      V1xS    <= ValidAnglexSI;
+      DeltaxD := AngleTargetxDI - AngleMeasuredxDI;
+      if DeltaxD(15) = '1' and DeltaxD(14 downto 0) /= 0 then
+        -- target is more than half a turn ahead: go clockwise
+        Dir1xS  <= '0';
+        Diff1xD <= 0 - DeltaxD;  -- 2^16 - Delta
+      else
+        Dir1xS  <= '1';
+        Diff1xD <= DeltaxD;
+      end if;
 
-        ----------------------------------------------------------------------
-        -- wait for a new angle, compute shortest signed distance on the circle
-        ----------------------------------------------------------------------
-        when IDLE =>
-          if ValidAnglexSI = '1' then
-            DeltaxD := AngleTargetxDI - AngleMeasuredxDI;  -- wraps modulo 2^16
-            if DeltaxD(15) = '1' and DeltaxD(14 downto 0) /= 0 then
-              -- target is more than half a turn ahead: go clockwise
-              DirxS       <= '0';
-              AngleDiffxD <= 0 - DeltaxD;  -- 2^16 - Delta
-            else
-              DirxS       <= '1';
-              AngleDiffxD <= DeltaxD;
-            end if;
-            State <= CLASSIFY;
-          end if;
+      ------------------------------------------------------------------------
+      -- stage 2: steps = Diff / ROT_PER_STEP via MACC, partial VMax via table
+      ------------------------------------------------------------------------
+      V2xS    <= V1xS;
+      Dir2xS  <= Dir1xS;
+      Prod2xD <= Diff1xD * to_unsigned(RECIP_M, 17);
 
-        ----------------------------------------------------------------------
-        -- select the case and load the divider
-        ----------------------------------------------------------------------
-        when CLASSIFY =>
-          CntxD <= 0;
-          RemxD <= (others => '0');
-          if AngleDiffxD > ROT_PER_STEP then
-            -- far from target: steps = AngleDiff / ROT_PER_STEP
-            FarxS     <= '1';
-            ReachedxS <= '0';
-            NumQuotxD <= resize(AngleDiffxD, DIV_W);
-            State     <= DIVIDE;
-          elsif AngleDiffxD > ROT_ACCURACY then
-            -- close to target: VMax = (2^16 - 1) * AngleDiff / ROT_PER_STEP
-            FarxS     <= '0';
-            ReachedxS <= '0';
-            NumQuotxD <= (AngleDiffxD & x"0000") - resize(AngleDiffxD, DIV_W);
-            State     <= DIVIDE;
-          else
-            -- target reached, nothing to divide
-            FarxS     <= '0';
-            ReachedxS <= '1';
-            NumQuotxD <= (others => '0');
-            State     <= OUTPUT;
-          end if;
+      if Diff1xD <= ROT_PER_STEP then
+        IdxxD := to_integer(Diff1xD);
+      else
+        IdxxD := 0;
+      end if;
+      Vmax2xD <= VMAX_ROM(IdxxD);
 
-        ----------------------------------------------------------------------
-        -- restoring division by the constant ROT_PER_STEP, 1 bit per clock
-        ----------------------------------------------------------------------
-        when DIVIDE =>
-          ShiftedxD := RemxD(15 downto 0) & NumQuotxD(DIV_W - 1);
-          if ShiftedxD >= DEN then
-            RemxD     <= ShiftedxD - DEN;
-            NumQuotxD <= NumQuotxD(DIV_W - 2 downto 0) & '1';
-          else
-            RemxD     <= ShiftedxD;
-            NumQuotxD <= NumQuotxD(DIV_W - 2 downto 0) & '0';
-          end if;
+      Far2xS   <= '0';
+      Close2xS <= '0';
+      if Diff1xD > ROT_PER_STEP then
+        Far2xS <= '1';
+      elsif Diff1xD > ROT_ACCURACY then
+        Close2xS <= '1';
+      end if;
 
-          if CntxD = DIV_W - 1 then
-            State <= OUTPUT;
-          else
-            CntxD <= CntxD + 1;
-          end if;
+      ------------------------------------------------------------------------
+      -- stage 3: output registers
+      ------------------------------------------------------------------------
+      OutputValidxSO <= V2xS;
+      if V2xS = '1' then
+        if Far2xS = '1' then
+          RotDirectionxSO <= Dir2xS;
+          VMaxExtxDO      <= (others => '1');
+          StepNumberxDO   <= to_integer(Prod2xD(RECIP_S + 10 downto RECIP_S));
+        elsif Close2xS = '1' then
+          RotDirectionxSO <= Dir2xS;
+          VMaxExtxDO      <= Vmax2xD;
+          StepNumberxDO   <= 1;
+        else
+          VMaxExtxDO      <= (others => '0');
+          StepNumberxDO   <= 0;
+        end if;
+      end if;
 
-        ----------------------------------------------------------------------
-        -- register results, 1 cycle OutputValid pulse
-        ----------------------------------------------------------------------
-        when OUTPUT =>
-          if ReachedxS = '1' then
-            StepNumberxDO <= 0;
-            VMaxExtxDO    <= (others => '0');
-          elsif FarxS = '1' then
-            RotDirectionxSO <= DirxS;
-            VMaxExtxDO      <= (others => '1');
-            if NumQuotxD > MAX_STEPS then  -- cannot happen (<= 2^15/ROT_PER_STEP), safety clamp
-              StepNumberxDO <= MAX_STEPS;
-            else
-              StepNumberxDO <= to_integer(NumQuotxD(10 downto 0));
-            end if;
-          else
-            RotDirectionxSO <= DirxS;
-            VMaxExtxDO      <= std_logic_vector(NumQuotxD(15 downto 0));
-            StepNumberxDO   <= 1;
-          end if;
-          OutputValidxSO <= '1';
-          State          <= IDLE;
-
-      end case;
     end if;
   end process;
 
