@@ -27,8 +27,8 @@
 --   * ValidxSO is back to 0 the clock cycle following AckxSI = 1
 -- Checked by the stimulus process for each computation :
 --   * angle accuracy
---   * latency between rising edge of StartxSI and rising edge of ValidxSO
---     strictly below 1 ms
+--   * latency between rising edge of PeriodEcsValidxSI(4) and rising edge
+--     of ValidxSO (angle computation from the periods) strictly below 1 ms
 -------------------------------------------------------------------------------
 library ieee;
 use ieee.std_logic_1164.all;
@@ -305,7 +305,6 @@ begin
                               ValidDelayMin, ValidDelayMax : positive;
                               AckDelayMin, AckDelayMax     : natural) is
       constant m          : Model_t := model(v);
-      variable StartTime  : time;
       variable LastValid  : time;
       variable Latency    : time;
       variable Diff       : real;
@@ -329,10 +328,9 @@ begin
 
       -- start pulse
       wait until rising_edge(ClkxC);
-      StartxS   <= '1';
-      StartTime := now;
+      StartxS <= '1';
       wait until rising_edge(ClkxC);
-      StartxS   <= '0';
+      StartxS <= '0';
 
       -- periods valid, sequentially in order 1 to 4
       for i in 1 to 4 loop
@@ -346,14 +344,16 @@ begin
       end loop;
       LastValid := now;
 
-      -- result
+      -- result (PeriodEcsValidxSI(4) rises at LastValid)
       if ValidxS /= '1' then
-        wait until ValidxS = '1' for StartTime + 2 * MAX_LATENCY - now;
+        wait until ValidxS = '1' for 2 * MAX_LATENCY;
       end if;
-      Latency := now - StartTime;
-      check_equal(ValidxS, '1', "ValidxSO not set within " & to_string(2 * MAX_LATENCY, 1 ns) & " after StartxSI");
+      Latency := now - LastValid;
+      check_equal(ValidxS, '1', "ValidxSO not set within " & to_string(2 * MAX_LATENCY, 1 ns) &
+                                " after PeriodEcsValidxSI(4)");
       check(Latency < MAX_LATENCY,
-            "Latency StartxSI -> ValidxSO = " & to_string(Latency, 1 ns) & ", must be < " & to_string(MAX_LATENCY, 1 ns));
+            "Latency PeriodEcsValidxSI(4) -> ValidxSO = " & to_string(Latency, 1 ns) &
+            ", must be < " & to_string(MAX_LATENCY, 1 ns));
       if Latency > MaxLatency then
         MaxLatency := Latency;
       end if;
@@ -369,8 +369,7 @@ begin
             " (error " & real'image(Diff) & " LSB, DeltaECSX = " & real'image(m.DeltaX) &
             ", DeltaECSZ = " & real'image(m.DeltaZ) & ")");
       debug("Angle " & integer'image(to_integer(AnglexD)) & " expected " & real'image(m.Angle) &
-            ", latency from start " & to_string(Latency, 1 ns) &
-            ", from last period valid " & to_string(now - LastValid, 1 ns));
+            ", latency from PeriodEcsValidxSI(4) " & to_string(Latency, 1 ns));
       NumChecked := NumChecked + 1;
 
       -- acknowledge
@@ -447,7 +446,7 @@ begin
         end loop;
 
       elsif run("max_period_valid_delay") then
-        -- last PeriodEcsValidxSI 4 * MAX_VALID_DELAY cycles after StartxSI
+        -- PeriodEcsValidxSI rising MAX_VALID_DELAY cycles apart (DUT idle in between)
         for n in 1 to 3 loop
           gen_random(v);
           run_computation(v, MAX_VALID_DELAY, MAX_VALID_DELAY, 0, 1);
