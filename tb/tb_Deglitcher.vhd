@@ -2,8 +2,8 @@
 -- Self-checking testbench for Deglitcher
 --
 -- For several PULSE_WIDTH values, with and without resynchronization, checks
--- that pulses of PULSE_WIDTH - 1 cycles are rejected and pulses of
--- PULSE_WIDTH cycles are passed, for both polarities and both default levels.
+-- that pulses of up to PULSE_WIDTH cycles are rejected and pulses of
+-- PULSE_WIDTH + 1 cycles are passed, for both polarities and both default levels.
 --------------------------------------------------------------------------------
 library ieee;
 use ieee.std_logic_1164.all;
@@ -27,12 +27,10 @@ architecture sim of tb_Deglitcher_Unit is
   signal OutxS   : std_logic;
   signal DonexS  : boolean := false;
 
+  -- Shortest pulse that goes through the deglitcher
   function EffWidth return positive is
   begin
-    if PULSE_WIDTH = 0 then
-      return 1;
-    end if;
-    return PULSE_WIDTH;
+    return PULSE_WIDTH + 1;
   end function;
 
   function SyncDelay return natural is
@@ -99,14 +97,14 @@ begin
       Drive(Idle, SyncDelay + 2);
       Check(Idle, "burst of short pulses not filtered");
 
-      -- A change lasting PULSE_WIDTH cycles must go through, after exactly
-      -- PULSE_WIDTH (+ synchronizer) cycles
+      -- A change lasting PULSE_WIDTH + 1 cycles must go through, after exactly
+      -- PULSE_WIDTH + 1 (+ synchronizer) cycles
       Drive(not Idle, EffWidth + SyncDelay - 1);
       Check(Idle, "output changed too early");
       Drive(not Idle, 1);
       Check(not Idle, "output did not change");
 
-      -- A pulse of exactly PULSE_WIDTH cycles is passed with the same width
+      -- A pulse of exactly PULSE_WIDTH + 1 cycles is passed with the same width
       -- (output is now at "not Idle"; the pulse goes back to Idle)
       for k in 1 to 2 * EffWidth + SyncDelay + 2 loop
         if k <= EffWidth then
